@@ -1,0 +1,33 @@
+{
+  "name": "ore-history-collector",
+  "version": "1.0.0",
+  "description": "ORE round data collector with pre-fin and post-fin snapshots",
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsx watch src/index.ts",
+    "db:init": "tsx scripts/init-db.ts",
+    "db:check": "tsx scripts/check-db.ts",
+    "db:reset": "tsx scripts/reset-db.ts",
+    "lint": "eslint src --ext .ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@solana/web3.js": "^1.95.0",
+    "better-sqlite3": "^11.0.0",
+    "dotenv": "^16.4.0",
+    "zod": "^3.23.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.0",
+    "@types/node": "^20.0.0",
+    "tsx": "^4.0.0",
+    "typescript": "^5.4.0"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}
+

@@ -72,7 +72,6 @@ CREATE TABLE IF NOT EXISTS tiles (
     miners_count        INTEGER NOT NULL,       -- Miner count
     others_stake        INTEGER NOT NULL,       -- Others' stake (lamports)
     ev_ratio            REAL NOT NULL,          -- Expected value ratio
-    stake_suggested     INTEGER NOT NULL,       -- Suggested stake (lamports)
     max_profitable      INTEGER NOT NULL,       -- Max profitable stake (lamports)
     rank_ev             INTEGER NOT NULL,       -- EV ranking (1-25)
 

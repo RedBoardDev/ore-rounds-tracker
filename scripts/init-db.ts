@@ -60,7 +60,6 @@ CREATE TABLE IF NOT EXISTS tiles (
     miners_count        INTEGER NOT NULL,
     others_stake        INTEGER NOT NULL,
     ev_ratio            REAL NOT NULL,
-    stake_suggested     INTEGER NOT NULL,
     max_profitable      INTEGER NOT NULL,
     rank_ev             INTEGER NOT NULL,
     deployed_final      INTEGER,

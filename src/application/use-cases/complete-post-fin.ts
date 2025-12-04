@@ -10,17 +10,23 @@
  * If validation fails, the round is deleted and Discord is notified.
  */
 
+import type { Commitment } from "@solana/web3.js";
 import type { BoardAccount } from "../../infrastructure/solana/decoders/board.decoder.js";
+import type { RoundAccount } from "../../infrastructure/solana/decoders/round.decoder.js";
 import type { RoundPostFin, TilePostFin } from "../../domain/entities/index.js";
 import type { IRoundRepository } from "../../domain/interfaces/round.repository.js";
 import type { INotifier } from "../../domain/interfaces/notifier.js";
-import { fetchRoundStateOrNull } from "../../infrastructure/fetchers/round-state.fetcher.js";
+import { fetchRoundStateWithContext } from "../../infrastructure/fetchers/round-state.fetcher.js";
 import { isSlotHashValid } from "../../infrastructure/solana/decoders/round.decoder.js";
 import { SPLIT_ADDRESS } from "../../infrastructure/solana/constants.js";
 import { computeRng, computeWinningTile } from "../services/rng-calculator.js";
 import { getLogger } from "../../shared/logger.js";
+import { sleep } from "../../shared/retry.js";
 
 const logger = getLogger().child("PostFin");
+const SLOT_HASH_RETRY_BASE_MS = 1500;
+const SLOT_HASH_MAX_ATTEMPTS = 6;
+const POST_FIN_DELAY_MS = 1200; // ~2 slots buffer to let RPC catch up
 
 export interface PostFinContext {
   previousRoundId: bigint;
@@ -30,6 +36,73 @@ export interface PostFinContext {
 export interface PostFinDependencies {
   repository: IRoundRepository;
   notifier: INotifier;
+}
+
+interface ValidatedRoundState {
+  roundState: RoundAccount;
+  contextSlot: bigint;
+  attempts: number;
+  commitment: Commitment;
+}
+
+function getSafeMinContextSlot(board: BoardAccount): number | undefined {
+  if (board.startSlot <= BigInt(Number.MAX_SAFE_INTEGER)) {
+    return Number(board.startSlot);
+  }
+  return undefined;
+}
+
+async function fetchRoundStateWithValidSlotHash(
+  roundId: bigint,
+  minContextSlot?: number
+): Promise<ValidatedRoundState> {
+  let lastError: Error | null = null;
+
+  for (let attempt = 1; attempt <= SLOT_HASH_MAX_ATTEMPTS; attempt++) {
+    const commitment: Commitment = attempt <= 3 ? "confirmed" : "finalized";
+
+    try {
+      const { roundState, contextSlot } = await fetchRoundStateWithContext(roundId, {
+        commitment,
+        minContextSlot,
+        retries: 1,
+        delayMs: SLOT_HASH_RETRY_BASE_MS,
+      });
+
+      if (isSlotHashValid(roundState.slotHash)) {
+        return { roundState, contextSlot, attempts: attempt, commitment };
+      }
+
+      lastError = new Error(
+        `Invalid slot hash (contextSlot=${contextSlot.toString()}, commitment=${commitment})`
+      );
+
+      logger.warn("Slot hash invalid, retrying", {
+        roundId: roundId.toString(),
+        attempt,
+        commitment,
+        contextSlot: contextSlot.toString(),
+        minContextSlot,
+        hashPrefix: roundState.slotHash.subarray(0, 8).toString("hex"),
+      });
+    } catch (error) {
+      lastError = error instanceof Error ? error : new Error(String(error));
+
+      logger.warn("Post-fin round fetch failed, retrying", {
+        roundId: roundId.toString(),
+        attempt,
+        commitment,
+        minContextSlot,
+        error: lastError.message,
+      });
+    }
+
+    if (attempt < SLOT_HASH_MAX_ATTEMPTS) {
+      await sleep(SLOT_HASH_RETRY_BASE_MS * attempt);
+    }
+  }
+
+  throw lastError ?? new Error("Slot hash remained invalid after retries");
 }
 
 /**
@@ -57,21 +130,18 @@ export async function completePostFin(
       return true;
     }
 
-    // * Fetch round state
-    const roundState = await fetchRoundStateOrNull(roundId);
-
-    if (!roundState) {
-      logger.error("Round account not found on-chain", { roundId: roundId.toString() });
-      await handleFailure(roundId, "Round account not found on-chain", deps);
-      return false;
+    // * Small buffer so RPC catches up (reduces minContextSlot misses)
+    if (POST_FIN_DELAY_MS > 0) {
+      logger.debug("Post-fin delay before fetch", { delayMs: POST_FIN_DELAY_MS });
+      await sleep(POST_FIN_DELAY_MS);
     }
 
-    // * Validate slot hash
-    if (!isSlotHashValid(roundState.slotHash)) {
-      logger.error("Invalid slot hash (all zeros)", { roundId: roundId.toString() });
-      await handleFailure(roundId, "Invalid slot hash (refund round)", deps);
-      return false;
-    }
+    // * Fetch round state with slot hash validation + RPC context awareness
+    const minContextSlot = getSafeMinContextSlot(context.newBoard);
+    const { roundState, contextSlot, attempts, commitment } = await fetchRoundStateWithValidSlotHash(
+      roundId,
+      minContextSlot
+    );
 
     // * Calculate RNG and winning tile
     const rngU64 = computeRng(roundState.slotHash);
@@ -116,6 +186,9 @@ export async function completePostFin(
       winningTile,
       numWinners: postFin.numWinners.toString(),
       totalWinnings: roundState.totalWinnings.toString(),
+      fetchAttempts: attempts,
+      fetchCommitment: commitment,
+      fetchContextSlot: contextSlot.toString(),
     });
 
     return true;
@@ -167,24 +240,6 @@ export async function completePendingRounds(deps: PostFinDependencies): Promise<
 
   for (const roundId of pendingIds) {
     try {
-      const roundState = await fetchRoundStateOrNull(roundId);
-
-      if (!roundState) {
-        logger.warn("Pending round not found on-chain, deleting", { roundId: roundId.toString() });
-        await deps.repository.deleteRound(roundId);
-        await deps.notifier.notifyFailure(roundId, "Pending round not found on-chain (cleanup)");
-        continue;
-      }
-
-      if (!isSlotHashValid(roundState.slotHash)) {
-        logger.warn("Pending round has invalid slot hash, deleting", { roundId: roundId.toString() });
-        await deps.repository.deleteRound(roundId);
-        await deps.notifier.notifyFailure(roundId, "Pending round has invalid slot hash (refund)");
-        continue;
-      }
-
-      // * Complete the round
-      // ! We need a mock BoardAccount here - using current values
       await completePostFin(
         { previousRoundId: roundId, newBoard: { roundId: roundId + 1n, startSlot: 0n, endSlot: 0n } },
         deps
@@ -197,4 +252,3 @@ export async function completePendingRounds(deps: PostFinDependencies): Promise<
     }
   }
 }
-
